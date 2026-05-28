@@ -1661,7 +1661,7 @@
       {
         "box": {
           "id": "obj-strum-dial",
-          "maxclass": "live.dial",
+          "maxclass": "live.numbox",
           "numinlets": 1,
           "numoutlets": 3,
           "outlettype": [
@@ -1669,8 +1669,10 @@
             "",
             ""
           ],
-          "dial_bipolar": 1,
           "parameter_enable": 1,
+          "appearance": 3,
+          "activedialcolor": [0.498, 0.819, 0.8, 1.0],
+          "fontname": "Avenir Medium",
           "saved_attribute_attributes": {
             "valueof": {
               "parameter_initial": [
@@ -1678,13 +1680,12 @@
               ],
               "parameter_initial_enable": 1,
               "parameter_longname": "strum_ms",
-              "parameter_range": [
-                -200,
-                200
-              ],
+              "parameter_mmin": -200,
+              "parameter_mmax": 200,
               "parameter_shortname": "strum",
               "parameter_type": 1,
               "parameter_unitstyle": 0,
+              "parameter_modmode": 2,
               "parameter_order": 12
             }
           },
@@ -1704,6 +1705,21 @@
           ],
           "annotation": "Strum: ms between successive chord notes. Positive = up (low to high), negative = down (high to low), 0 = block.",
           "annotation_name": "strum"
+        }
+      },
+      {
+        "box": {
+          "id": "obj-strum-label",
+          "maxclass": "comment",
+          "numinlets": 1,
+          "numoutlets": 0,
+          "text": "strum",
+          "fontsize": 9.0,
+          "fontname": "Avenir Medium",
+          "textjustification": 1,
+          "patching_rect": [20.0, 670.0, 56.0, 14.0],
+          "presentation": 1,
+          "presentation_rect": [372.0, 14.0, 56.0, 12.0]
         }
       },
       {
