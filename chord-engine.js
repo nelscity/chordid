@@ -97,6 +97,7 @@ const state = {
 
   inputPitch: -1,           // full MIDI pitch of the key the user actually pressed
   inputPitchWrapped: -1,
+  heldKeys: [],             // full MIDI pitches in press order; top = current input. Only tracks while latchKey is off.
   lastInputVelocity: 100,
   lastKeyPressTime: -1,
   outputNotes: new Array(128).fill(false),
@@ -367,6 +368,21 @@ function emitState() {
 
 function pendingTransportSensitive() { return state.quantizeInterval !== Quantize.None; }
 
+function pushHeld(pitch) {
+  const i = state.heldKeys.indexOf(pitch);
+  if (i !== -1) state.heldKeys.splice(i, 1);
+  state.heldKeys.push(pitch);
+}
+
+function removeHeld(pitch) {
+  const i = state.heldKeys.indexOf(pitch);
+  if (i !== -1) state.heldKeys.splice(i, 1);
+}
+
+function topHeld() {
+  return state.heldKeys.length > 0 ? state.heldKeys[state.heldKeys.length - 1] : -1;
+}
+
 function handleNote(pitch, velocity) {
   if (pitch < 0 || pitch > 127) return;
   let forceReplay = false;
@@ -380,31 +396,35 @@ function handleNote(pitch, velocity) {
   }
   if (noteOn) {
     if (state.latchKey || state.quantizeInterval !== Quantize.None) forceReplay = true;
+    if (!state.latchKey) pushHeld(pitch);
     state.inputPitch = pitch;
     state.inputPitchWrapped = pitch % 12;
     outlet(3, "input_pitch", pitch);
     if (velocity > 0) state.lastInputVelocity = velocity;
     state.lastKeyPressTime = now;
     state.lastPlayedChord = snapshotChordSettings();
-  } else {
+  } else if (state.latchKey) {
+    // Latch-mode unlatch: a re-press of the currently latched pitch class
+    // arrives here (noteOn evaluated false above). Velocity-zero events are
+    // already early-returned in the latch branch.
     if (pitch % 12 === state.inputPitchWrapped) {
       state.inputPitch = -1;
       state.inputPitchWrapped = -1;
       outlet(3, "input_pitch", -1);
-    } else if (state.inputPitchWrapped !== -1 && state.quantizeInterval === Quantize.None) {
-      // 100 ms grace window: when two keys overlap during fast chord changes,
-      // turn off only the shared chord pitches so the new chord's notes don't
-      // get orphaned by the departing key's release.
-      if (now < state.lastKeyPressTime + 100) {
-        const cur = getChordPitches(state.inputPitchWrapped);
-        const prev = getChordPitches(pitch % 12);
-        for (const p of cur) {
-          if (prev.indexOf(p) !== -1) {
-            sendMidi(p, 0, CHORD_CHANNEL);
-            state.outputNotes[p] = false;
-          }
-        }
-      }
+    }
+  } else {
+    // Pop this key off the held stack. If it was the top, fall back to the
+    // next-most-recent held key so a sustained C5 keeps the chord sounding
+    // after a brief C6 (or any other overlapping key) is released.
+    removeHeld(pitch);
+    const newTop = topHeld();
+    if (newTop !== state.inputPitch) {
+      state.inputPitch = newTop;
+      state.inputPitchWrapped = newTop === -1 ? -1 : newTop % 12;
+      outlet(3, "input_pitch", state.inputPitch);
+      // Refresh the locked chord snapshot for the falling-back key so the
+      // chord buttons toggled mid-hold actually take effect on the next note.
+      if (newTop !== -1) state.lastPlayedChord = snapshotChordSettings();
     }
   }
   scheduleOrUpdate(forceReplay);
@@ -413,6 +433,11 @@ function handleNote(pitch, velocity) {
 function scheduleOrUpdate(forceReplay) {
   if (pendingTransportSensitive()) {
     state.pendingReplay = state.pendingReplay || forceReplay;
+    // Display and Move state still need to follow input + button changes
+    // even while MIDI emission is deferred to the next transport tick;
+    // otherwise the chord name lags a beat behind the user's input.
+    emitDisplay();
+    emitState();
     return;
   }
   updateOutputNotes(forceReplay);
@@ -515,15 +540,25 @@ function param(name, value) {
     case "play_options": state.playOptions = value | 0; break;
     case "latch_key":
       state.latchKey = !!value;
+      // Clear the held-key stack either way: it doesn't represent reality
+      // across a latch toggle (latch-on ignores MIDI key-ups, so the stack
+      // would go stale; latch-off should start fresh).
+      state.heldKeys = [];
       if (!state.latchKey) {
         state.inputPitch = -1;
         state.inputPitchWrapped = -1;
         outlet(3, "input_pitch", -1);
+        // Release any chord notes the previously-latched key was sounding.
+        scheduleOrUpdate(false);
+        return;
       }
       break;
     case "latch_chord": state.latchChord = !!value; break;
     case "voicing": state.voicing = value | 0; outlet(3, "voicing", state.voicing); break;
-    case "voicing_delta": state.voicing = Math.max(0, Math.min(115, state.voicing + (value | 0))); break;
+    case "voicing_delta":
+      state.voicing = Math.max(0, Math.min(115, state.voicing + (value | 0)));
+      outlet(3, "voicing", state.voicing);
+      break;
     case "bass_voicing": state.bassVoicing = value | 0; outlet(3, "bass_voicing", state.bassVoicing); break;
     case "velocity_override": state.velocityOverride = value | 0; break;
     case "chord_style": state.chordStyle = value | 0; break;
@@ -589,7 +624,9 @@ function panic() {
   if (state.bassOutputPitch !== -1) sendMidi(state.bassOutputPitch, 0, BASS_CHANNEL);
   state.outputNotes = new Array(128).fill(false);
   state.bassOutputPitch = -1;
+  state.inputPitch = -1;
   state.inputPitchWrapped = -1;
+  state.heldKeys = [];
   state.currentArpPitches = [];
   emitDisplay();
   emitState();
