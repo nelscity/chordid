@@ -7,6 +7,7 @@
 //   list pitch velocity            (bare list from midiparse outlet 0)
 //   param name value               (UI parameter changes)
 //   tick                           (transport quantize tick)
+//   arp_tick                       (arp clock tick from maxpat-side metro)
 //   panic                          (flush held notes)
 //   bang                           (re-emit display + state)
 //
@@ -15,9 +16,10 @@
 //   1  ["chord_display", "Cmaj7"]         -> comment widget
 //   2  ["state", json]                    -> move-bridge
 //   3  pitch + velocity ints             -> kslider visualizer
+//   4  ["arp_run", 0|1]                   -> maxpat metro start/stop
 
 inlets = 1;
-outlets = 4;
+outlets = 5;
 autowatch = 1;
 
 const PITCHES_PER_OCTAVE = 12;
@@ -48,6 +50,24 @@ const Quantize = Object.freeze({
   N8: 3,
   N4: 4,
 });
+
+const ArpType = Object.freeze({
+  Off: 0,
+  Up: 1,
+  Down: 2,
+  UpDown: 3,
+  DownUp: 4,
+  UpAndDown: 5,
+  DownAndUp: 6,
+  Converge: 7,
+  Diverge: 8,
+  RandomOnce: 9,
+  Random: 10,
+});
+
+// Arp rates in fractions of a quarter note (a "beat").
+// Matches the parameter_enum order in the maxpat: 1/32, 1/16T, 1/16, 1/8T, 1/8, 1/4T, 1/4, 1/2.
+const ARP_RATE_BEATS = [0.125, 1.0 / 6.0, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0, 2.0];
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -84,6 +104,17 @@ const state = {
   latchChord: false,
   lastPlayedChord: null,
   pendingReplay: false,
+
+  strumMs: 0,                  // signed: -200..+200 ms between successive notes; 0 = no strum
+  pendingStrumTasks: [],       // Max Task objects for in-flight strum note-ons
+  arpType: ArpType.Off,
+  arpRateIdx: 4,               // index into ARP_RATE_BEATS (default 1/8)
+  arpStep: 0,
+  arpSequence: [],
+  arpCurrentNote: -1,          // pitch currently sounding from the arp; -1 = none
+  arpRunning: false,           // mirrors the metro's run state
+  currentArpPitches: [],       // chord pitches the arp is cycling through
+  bpm: 120,                    // Live transport tempo, fed in by maxpat live.observer
 };
 
 function snapshotChordSettings() {
@@ -99,6 +130,7 @@ function getActiveChordSettings() {
     state.playOptions === PlayOptions.ChordOnPress ||
     state.playOptions === PlayOptions.ImmediateChord ||
     state.playOptions === PlayOptions.ImmediateChordOnly ||
+    state.arpType !== ArpType.Off ||
     state.inputPitchWrapped === -1 ||
     state.lastPlayedChord === null
   ) {
@@ -214,6 +246,110 @@ function sendMidi(pitch, velocity, channel) {
   if (channel === CHORD_CHANNEL) outlet(3, pitch, velocity);
 }
 
+function cancelPendingStrum() {
+  for (let i = 0; i < state.pendingStrumTasks.length; ++i) {
+    try { state.pendingStrumTasks[i].cancel(); } catch (e) {}
+  }
+  state.pendingStrumTasks = [];
+}
+
+function strumNoteOn(pitch, velocity, delayMs) {
+  if (delayMs <= 0) {
+    sendMidi(pitch, velocity, CHORD_CHANNEL);
+    state.outputNotes[pitch] = true;
+    return;
+  }
+  const task = new Task(function () {
+    sendMidi(pitch, velocity, CHORD_CHANNEL);
+    state.outputNotes[pitch] = true;
+    const idx = state.pendingStrumTasks.indexOf(task);
+    if (idx !== -1) state.pendingStrumTasks.splice(idx, 1);
+  }, this);
+  task.schedule(delayMs);
+  state.pendingStrumTasks.push(task);
+}
+
+function computeArpSequence(pitches, arpType) {
+  const n = pitches.length;
+  if (n === 0) return [];
+  switch (arpType) {
+    case ArpType.Up: return pitches.slice();
+    case ArpType.Down: return pitches.slice().reverse();
+    case ArpType.UpDown: {
+      if (n === 1) return pitches.slice();
+      const seq = pitches.slice();
+      for (let i = n - 2; i >= 1; --i) seq.push(pitches[i]);
+      return seq;
+    }
+    case ArpType.DownUp: {
+      if (n === 1) return pitches.slice();
+      const seq = pitches.slice().reverse();
+      for (let i = 1; i < n - 1; ++i) seq.push(pitches[i]);
+      return seq;
+    }
+    case ArpType.UpAndDown: {
+      const seq = pitches.slice();
+      for (let i = n - 1; i >= 0; --i) seq.push(pitches[i]);
+      return seq;
+    }
+    case ArpType.DownAndUp: {
+      const seq = pitches.slice().reverse();
+      for (let i = 0; i < n; ++i) seq.push(pitches[i]);
+      return seq;
+    }
+    case ArpType.Converge: {
+      const seq = [];
+      let lo = 0, hi = n - 1;
+      while (lo <= hi) {
+        seq.push(pitches[lo]);
+        if (hi !== lo) seq.push(pitches[hi]);
+        lo++; hi--;
+      }
+      return seq;
+    }
+    case ArpType.Diverge: {
+      const seq = [];
+      const mid = Math.floor((n - 1) / 2);
+      seq.push(pitches[mid]);
+      for (let d = 1; d <= n; ++d) {
+        if (mid - d >= 0) seq.push(pitches[mid - d]);
+        if (mid + d < n && (mid + d) !== (mid - d)) seq.push(pitches[mid + d]);
+      }
+      return seq;
+    }
+    case ArpType.RandomOnce: {
+      const seq = pitches.slice();
+      for (let i = seq.length - 1; i > 0; --i) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const t = seq[i]; seq[i] = seq[j]; seq[j] = t;
+      }
+      return seq;
+    }
+    case ArpType.Random: return pitches.slice();
+    default: return [];
+  }
+}
+
+function setArpRunning(running) {
+  if (running === state.arpRunning) return;
+  state.arpRunning = running;
+  outlet(4, "arp_run", running ? 1 : 0);
+  if (!running) {
+    if (state.arpCurrentNote !== -1) {
+      sendMidi(state.arpCurrentNote, 0, CHORD_CHANNEL);
+      state.arpCurrentNote = -1;
+    }
+    state.arpStep = 0;
+  }
+}
+
+function recomputeArpInterval() {
+  if (state.bpm <= 0) return;
+  const beats = ARP_RATE_BEATS[state.arpRateIdx] || 0.5;
+  const ms = (60000.0 / state.bpm) * beats;
+  outlet(4, "arp_interval", ms);
+}
+
 function emitDisplay() { outlet(1, "chord_display", getChordDisplayString()); }
 
 function emitState() {
@@ -284,35 +420,76 @@ function scheduleOrUpdate(forceReplay) {
 
 function updateOutputNotes(forceReplay) {
   const s = getActiveChordSettings();
-  const newOutput = new Array(128).fill(false);
   let chordPitches = [];
   let bassPitch = -1;
   if (state.inputPitchWrapped !== -1) {
     if (shouldPlayChord(s)) chordPitches = getChordPitches(state.inputPitchWrapped);
     if (shouldPlayBass(s)) bassPitch = adjustForVoicing(state.inputPitchWrapped, state.bassVoicing);
   }
-  for (const p of chordPitches) if (p >= 0 && p < 127) newOutput[p] = true;
 
-  for (let i = 0; i < 128; ++i) {
-    if (newOutput[i] && (!state.outputNotes[i] || forceReplay)) {
-      let v = state.lastInputVelocity || 100;
-      if (state.velocityOverride !== -1) v = state.velocityOverride;
-      sendMidi(i, v, CHORD_CHANNEL);
-    } else if (!newOutput[i] && state.outputNotes[i]) {
-      sendMidi(i, 0, CHORD_CHANNEL);
+  const arpActive = state.arpType !== ArpType.Off && chordPitches.length > 0;
+  state.currentArpPitches = chordPitches.slice();
+
+  if (arpActive) {
+    // Suppress normal chord emission; the arp tick owns channel-1 output.
+    for (let i = 0; i < 128; ++i) {
+      if (state.outputNotes[i]) sendMidi(i, 0, CHORD_CHANNEL);
     }
+    state.outputNotes = new Array(128).fill(false);
+    cancelPendingStrum();
+
+    // Don't release arpCurrentNote here on chord/voicing change — the next arp
+    // tick releases it before firing the next note. Releasing it now would
+    // silence the arp during a rapid dial twist (each tick of the dial fires
+    // updateOutputNotes; if we released on every one, no note would sound
+    // between dial events).
+    state.arpSequence = computeArpSequence(chordPitches, state.arpType);
+    if (forceReplay) state.arpStep = 0;
+    setArpRunning(true);
+  } else {
+    setArpRunning(false);
+    cancelPendingStrum();
+
+    const newOutput = new Array(128).fill(false);
+    for (const p of chordPitches) if (p >= 0 && p < 128) newOutput[p] = true;
+
+    const newOnPitches = [];
+    for (let i = 0; i < 128; ++i) {
+      if (newOutput[i] && (!state.outputNotes[i] || forceReplay)) {
+        newOnPitches.push(i);
+      } else if (!newOutput[i] && state.outputNotes[i]) {
+        sendMidi(i, 0, CHORD_CHANNEL);
+        state.outputNotes[i] = false;
+      }
+    }
+
+    const velocity = state.velocityOverride !== -1 ? state.velocityOverride : (state.lastInputVelocity || 100);
+    const strumMs = state.strumMs | 0;
+    const n = newOnPitches.length;
+    if (strumMs > 0) {
+      for (let k = 0; k < n; ++k) strumNoteOn(newOnPitches[k], velocity, k * strumMs);
+    } else if (strumMs < 0) {
+      const gap = -strumMs;
+      for (let k = 0; k < n; ++k) strumNoteOn(newOnPitches[n - 1 - k], velocity, k * gap);
+    } else {
+      for (let k = 0; k < n; ++k) strumNoteOn(newOnPitches[k], velocity, 0);
+    }
+
+    // Don't bulk-set state.outputNotes = newOutput — pending strum note-ons
+    // would be marked "on" before they fire, and a chord update mid-strum
+    // would cancel them while the comparison treats them as already sounding,
+    // so they would never play. Note-offs above explicitly clear the bit;
+    // strum tasks set their bit when they actually fire.
   }
 
   if (bassPitch !== state.bassOutputPitch) {
     if (state.bassOutputPitch !== -1) sendMidi(state.bassOutputPitch, 0, BASS_CHANNEL);
     if (bassPitch !== -1) {
-      let v = state.lastInputVelocity || 100;
-      if (state.velocityOverride !== -1) v = state.velocityOverride;
+      const v = state.velocityOverride !== -1 ? state.velocityOverride : (state.lastInputVelocity || 100);
       sendMidi(bassPitch, v, BASS_CHANNEL);
     }
   }
 
-  state.outputNotes = newOutput;
   state.bassOutputPitch = bassPitch;
   state.pendingReplay = false;
   emitDisplay();
@@ -352,6 +529,10 @@ function param(name, value) {
     case "chord_style": state.chordStyle = value | 0; break;
     case "scale_mode": state.scaleMode = !!value; outlet(3, "scale_mode", state.scaleMode ? 1 : 0); break;
     case "scale_root": state.scaleRoot = (value | 0) % 12; outlet(3, "scale_root", state.scaleRoot); break;
+    case "strum_ms": state.strumMs = value | 0; return;
+    case "arp_type": state.arpType = value | 0; break;
+    case "arp_rate": state.arpRateIdx = value | 0; recomputeArpInterval(); return;
+    case "bpm": state.bpm = +value || 120; recomputeArpInterval(); return;
     default: return;
   }
   if (state.playOptions === PlayOptions.ImmediateChord || state.playOptions === PlayOptions.ImmediateChordOnly) {
@@ -374,7 +555,34 @@ function scale_pitches() {
 
 function tick() { updateOutputNotes(state.pendingReplay); }
 
+function arp_tick() {
+  if (state.arpType === ArpType.Off) return;
+  const pitches = state.currentArpPitches;
+  if (!pitches || pitches.length === 0) return;
+
+  if (state.arpCurrentNote !== -1) {
+    sendMidi(state.arpCurrentNote, 0, CHORD_CHANNEL);
+    state.arpCurrentNote = -1;
+  }
+
+  let pitch;
+  if (state.arpType === ArpType.Random) {
+    pitch = pitches[Math.floor(Math.random() * pitches.length)];
+  } else {
+    const seq = state.arpSequence;
+    if (!seq || seq.length === 0) return;
+    pitch = seq[state.arpStep % seq.length];
+    state.arpStep = (state.arpStep + 1) % seq.length;
+  }
+
+  const velocity = state.velocityOverride !== -1 ? state.velocityOverride : (state.lastInputVelocity || 100);
+  sendMidi(pitch, velocity, CHORD_CHANNEL);
+  state.arpCurrentNote = pitch;
+}
+
 function panic() {
+  cancelPendingStrum();
+  setArpRunning(false);
   for (let i = 0; i < 128; ++i) {
     if (state.outputNotes[i]) sendMidi(i, 0, CHORD_CHANNEL);
   }
@@ -382,6 +590,7 @@ function panic() {
   state.outputNotes = new Array(128).fill(false);
   state.bassOutputPitch = -1;
   state.inputPitchWrapped = -1;
+  state.currentArpPitches = [];
   emitDisplay();
   emitState();
 }
